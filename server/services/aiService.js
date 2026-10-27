@@ -19,20 +19,21 @@ Instructions:
 export async function generateChatResponse(messages, abortSignal) {
   const google = createGoogleGenerativeAI({
     apiKey:
-      process.env.GEMINI_API_KEY ||
-      process.env.GOOGLE_GENERATIVE_AI_API_KEY,
+      process.env.GEMINI_API_KEY || process.env.GOOGLE_GENERATIVE_AI_API_KEY,
   });
 
   const modelMessages = messages.map((message) => ({
     role: message.role,
     content: message.content,
   }));
+  const modelName = process.env.GEMINI_MODEL || "gemini-flash-lite-latest";
+
   return streamText({
-    model: google('gemini-3.8-flash'),
+    model: google(modelName),
 
     system: SYSTEM_PROMPT,
 
-    messages:modelMessages,
+    messages: modelMessages,
 
     abortSignal,
 

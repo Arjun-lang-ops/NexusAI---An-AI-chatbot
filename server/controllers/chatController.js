@@ -132,7 +132,7 @@ export async function sendMessage(req, res) {
       });
     }
 
-    await Message.create({
+    const userMessage = await Message.create({
       conversationId: conversation._id,
       role: "user",
       content: message,
@@ -149,52 +149,116 @@ export async function sendMessage(req, res) {
       content: item.content,
     }));
 
-    const result = await generateChatResponse(modelMessages, req.signal);
-
-    const generated = await result.output;
-
-    const validated = aiResponseSchema.safeParse(generated);
-
-    if (!validated.success) {
-      return res.status(502).json({
-        error: "The AI returned invalid structured data",
-      });
+    // Setup Server-Sent Events (SSE) headers for real-time streaming
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    if (typeof res.flushHeaders === "function") {
+      res.flushHeaders();
     }
 
-    const { answer, metadata } = validated.data;
+    // Emit initial event with conversation ID and user message info
+    res.write(
+      `data: ${JSON.stringify({
+        type: "start",
+        conversationId: conversation._id,
+        userMessage,
+      })}\n\n`
+    );
+
+    const result = await generateChatResponse(modelMessages, req.signal);
+
+    let streamedAnswer = "";
+    let streamedMetadata = null;
+
+    try {
+      for await (const partial of result.partialOutputStream) {
+        if (req.signal?.aborted) break;
+
+        if (partial?.answer !== undefined && partial.answer !== streamedAnswer) {
+          const delta = partial.answer.slice(streamedAnswer.length);
+          streamedAnswer = partial.answer;
+
+          if (partial.metadata) {
+            streamedMetadata = partial.metadata;
+          }
+
+          res.write(
+            `data: ${JSON.stringify({
+              type: "delta",
+              delta,
+              accumulated: streamedAnswer,
+              metadata: streamedMetadata,
+            })}\n\n`
+          );
+        }
+      }
+    } catch (streamErr) {
+      console.warn("Partial stream iteration note:", streamErr.message);
+    }
+
+    let finalAnswer = streamedAnswer;
+    let finalMetadata = streamedMetadata;
+
+    try {
+      const generated = await result.output;
+      if (generated?.answer) finalAnswer = generated.answer;
+      if (generated?.metadata) finalMetadata = generated.metadata;
+    } catch (outputErr) {
+      console.warn("Final output parsed from stream fallback:", outputErr.message);
+    }
+
+    if (!finalMetadata) {
+      finalMetadata = {
+        topic: "General",
+        intent: "other",
+        sentiment: "neutral",
+      };
+    }
 
     const assistantMessage = await Message.create({
       conversationId: conversation._id,
       role: "assistant",
-      content: answer,
-      metadata,
+      content: finalAnswer || "No response generated.",
+      metadata: finalMetadata,
     });
 
     conversation.updatedAt = new Date();
     await conversation.save();
 
-    return res.json({
-      conversationId: conversation._id,
-      message: assistantMessage,
-    });
+    res.write(
+      `data: ${JSON.stringify({
+        type: "done",
+        conversationId: conversation._id,
+        message: assistantMessage,
+      })}\n\n`
+    );
+
+    return res.end();
   } catch (error) {
     console.error("Chat generation error:", error);
 
-    if (
+    const errorMessage =
       error.statusCode === 429 ||
       error.data?.error?.code === "credit_balance_exhausted" ||
       error.data?.error?.type === "insufficient_quota"
-    ) {
-      return res.status(503).json({
-        success: false,
-        message:
-          "AI service is temporarily unavailable. Please try again later.",
-      });
+        ? "AI service is temporarily unavailable. Please try again later."
+        : error.message || "Failed to generate AI response.";
+
+    if (res.headersSent) {
+      res.write(
+        `data: ${JSON.stringify({
+          type: "error",
+          error: errorMessage,
+        })}\n\n`
+      );
+      return res.end();
     }
 
     return res.status(500).json({
       success: false,
-      message: "Failed to generate AI response.",
+      message: errorMessage,
     });
   }
 }

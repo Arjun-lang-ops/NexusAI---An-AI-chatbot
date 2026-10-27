@@ -868,6 +868,42 @@ p {
   transform: scale(1.05);
 }
 
+.send-btn.stop-btn {
+  background: rgba(239, 68, 68, 0.2);
+  color: #f87171;
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  box-shadow: 0 0 12px rgba(239, 68, 68, 0.25);
+  animation: pulse-stop 2s infinite ease-in-out;
+}
+
+.send-btn.stop-btn:hover {
+  background: rgba(239, 68, 68, 0.35);
+  color: #ffffff;
+  transform: scale(1.05);
+}
+
+@keyframes pulse-stop {
+  0%, 100% { box-shadow: 0 0 10px rgba(239, 68, 68, 0.2); }
+  50% { box-shadow: 0 0 16px rgba(239, 68, 68, 0.45); }
+}
+
+.streaming-cursor {
+  display: inline-block;
+  width: 7px;
+  height: 15px;
+  vertical-align: -2px;
+  margin-left: 4px;
+  background: var(--accent-light);
+  border-radius: 1px;
+  box-shadow: 0 0 8px var(--accent-glow);
+  animation: cursor-blink 0.75s infinite;
+}
+
+@keyframes cursor-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
 .send-btn:disabled {
   cursor: not-allowed;
 }

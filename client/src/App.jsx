@@ -3,6 +3,13 @@ import "./App.css";
 
 const API = "/api";
 
+const DEFAULT_TITLE = "New conversation";
+const isDefaultTitle = (t) => !t || t === DEFAULT_TITLE;
+const makeTitle = (text) => {
+  const clean = text.replace(/\s+/g, " ").trim();
+  return clean.length > 40 ? clean.slice(0, 40).trimEnd() + "…" : clean;
+};
+
 function App() {
   const [conversations, setConversations] = useState([]);
   const [conversationId, setConversationId] = useState(null);
@@ -11,11 +18,9 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [searchQuery, setSearchQuery] = useState("");
-  const [copiedId, setCopiedId] = useState(null);
-
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
+  const abortControllerRef = useRef(null);
 
   useEffect(() => {
     loadConversations();
@@ -25,20 +30,41 @@ function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
 
+  function stopGeneration() {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setLoading(false);
+    setMessages((prev) =>
+      prev.map((msg) =>
+        msg.isStreaming ? { ...msg, isStreaming: false } : msg
+      )
+    );
+  }
+
   async function loadConversations() {
     try {
       const response = await fetch(`${API}/conversations`);
       if (!response.ok) throw new Error("Failed to load conversations");
       const data = await response.json();
-      setConversations(data);
+      setConversations((prev) =>
+        data.map((c) => {
+          if (!isDefaultTitle(c.title)) return c;
+          const local = prev.find((p) => p._id === c._id);
+          return local && !isDefaultTitle(local.title)
+            ? { ...c, title: local.title }
+            : c;
+        })
+      );
     } catch (err) {
       setError(err.message);
     }
   }
 
   async function openConversation(id) {
-    if (loading) return;
     try {
+      stopGeneration();
       setError("");
       const response = await fetch(`${API}/conversations/${id}/messages`);
       if (!response.ok) throw new Error("Failed to load messages");
@@ -53,6 +79,7 @@ function App() {
 
   async function createConversation() {
     try {
+      stopGeneration();
       const response = await fetch(`${API}/conversations`, { method: "POST" });
       if (!response.ok) throw new Error("Failed to create conversation");
       const conversation = await response.json();
@@ -60,24 +87,6 @@ function App() {
       setConversationId(conversation._id);
       setMessages([]);
       inputRef.current?.focus();
-    } catch (err) {
-      setError(err.message);
-    }
-  }
-
-  async function deleteConversation(id, e) {
-    e.stopPropagation();
-    try {
-      const response = await fetch(`${API}/conversations/${id}`, {
-        method: "DELETE",
-      });
-      if (!response.ok) throw new Error("Failed to delete conversation");
-
-      setConversations((prev) => prev.filter((c) => c._id !== id));
-      if (conversationId === id) {
-        setConversationId(null);
-        setMessages([]);
-      }
     } catch (err) {
       setError(err.message);
     }
@@ -93,34 +102,39 @@ function App() {
     setLoading(true);
 
     let activeConversationId = conversationId;
+    const tempAssistantId = "temp-" + Date.now();
+
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
 
     try {
-      if (!activeConversationId) {
-        const createRes = await fetch(`${API}/conversations`, { method: "POST" });
-        if (!createRes.ok) throw new Error("Failed to create conversation");
-        const newConv = await createRes.json();
-        activeConversationId = newConv._id;
-        newConv.title = message.slice(0, 75);
-        setConversationId(activeConversationId);
-        setConversations((prev) => [newConv, ...prev]);
-      } else {
-        // Immediately show the question in the sidebar if it was untitled/new
+      setMessages((prev) => [
+        ...prev,
+        { role: "user", content: message, createdAt: new Date().toISOString() },
+        {
+          _id: tempAssistantId,
+          role: "assistant",
+          content: "",
+          isStreaming: true,
+          createdAt: new Date().toISOString(),
+        },
+      ]);
+
+      if (activeConversationId) {
         setConversations((prev) =>
           prev.map((c) =>
-            c._id === activeConversationId &&
-            (!c.title || c.title === "New conversation")
-              ? { ...c, title: message.slice(0, 75), updatedAt: new Date().toISOString() }
+            c._id === activeConversationId && isDefaultTitle(c.title)
+              ? { ...c, title: makeTitle(message) }
               : c
           )
         );
       }
 
-      setMessages((prev) => [...prev, { role: "user", content: message }]);
-
       const response = await fetch(`${API}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message, conversationId: activeConversationId }),
+        signal: abortController.signal,
       });
 
       if (!response.ok) {
@@ -128,13 +142,96 @@ function App() {
         throw new Error(data.message || data.error || "Failed to generate AI response");
       }
 
-      const data = await response.json();
-      setMessages((prev) => [...prev, data.message]);
-      await loadConversations();
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const blocks = buffer.split("\n\n");
+        buffer = blocks.pop() || "";
+
+        for (const block of blocks) {
+          const trimmed = block.trim();
+          if (!trimmed.startsWith("data:")) continue;
+          const jsonStr = trimmed.replace(/^data:\s*/, "");
+          if (!jsonStr) continue;
+
+          try {
+            const eventData = JSON.parse(jsonStr);
+
+            if (eventData.type === "start") {
+              if (eventData.conversationId) {
+                activeConversationId = eventData.conversationId;
+                setConversationId(eventData.conversationId);
+                setConversations((prev) => {
+                  const exists = prev.some((c) => c._id === eventData.conversationId);
+                  if (!exists) {
+                    return [
+                      {
+                        _id: eventData.conversationId,
+                        title: makeTitle(message),
+                        updatedAt: new Date().toISOString(),
+                      },
+                      ...prev,
+                    ];
+                  }
+                  return prev.map((c) =>
+                    c._id === eventData.conversationId && isDefaultTitle(c.title)
+                      ? { ...c, title: makeTitle(message) }
+                      : c
+                  );
+                });
+              }
+            } else if (eventData.type === "delta") {
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m._id === tempAssistantId
+                    ? {
+                        ...m,
+                        content: eventData.accumulated,
+                        metadata: eventData.metadata || m.metadata,
+                      }
+                    : m
+                )
+              );
+            } else if (eventData.type === "done") {
+              setMessages((prev) =>
+                prev.map((m) => (m._id === tempAssistantId ? eventData.message : m))
+              );
+              await loadConversations();
+            } else if (eventData.type === "error") {
+              throw new Error(eventData.error || "Generation error");
+            }
+          } catch (parseErr) {
+            if (parseErr.message !== "Generation error") {
+              console.warn("SSE parse error:", parseErr);
+            } else {
+              throw parseErr;
+            }
+          }
+        }
+      }
     } catch (err) {
-      setError(err.message);
+      if (err.name === "AbortError") {
+        // Stop generation requested by user
+      } else {
+        setError(err.message || "Failed to generate AI response");
+        setMessages((prev) =>
+          prev.filter((m) => m._id !== tempAssistantId || m.content)
+        );
+      }
     } finally {
       setLoading(false);
+      abortControllerRef.current = null;
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.isStreaming ? { ...m, isStreaming: false } : m
+        )
+      );
       inputRef.current?.focus();
     }
   }
@@ -156,13 +253,7 @@ function App() {
     if (conversation.title && conversation.title !== "New conversation") {
       return conversation.title;
     }
-    return "New chat (ask anything)";
-  }
-
-  function copyToClipboard(text, id) {
-    navigator.clipboard.writeText(text);
-    setCopiedId(id);
-    setTimeout(() => setCopiedId(null), 2000);
+    return "New conversation";
   }
 
   function formatTime(dateStr) {
@@ -190,17 +281,11 @@ function App() {
 
   const activeConversation = conversations.find((c) => c._id === conversationId);
 
-  const filteredConversations = conversations.filter((c) => {
-    if (!searchQuery.trim()) return true;
-    const title = getConversationPreview(c).toLowerCase();
-    return title.includes(searchQuery.toLowerCase());
-  });
-
   const suggestions = [
-    "Explain how neural networks learn in plain English",
-    "Help me write a clean Express route with validation",
-    "What are top 5 strategies to improve website performance?",
-    "Generate a weekly study schedule for machine learning",
+    "Explain quantum computing simply",
+    "Write a Python web scraper",
+    "What are the best productivity tips?",
+    "Summarize the history of the internet",
   ];
 
   return (
@@ -215,80 +300,41 @@ function App() {
           <button
             className="icon-btn"
             onClick={() => setSidebarOpen(false)}
-            title="Collapse sidebar"
-            aria-label="Collapse sidebar"
+            title="Close sidebar"
+            aria-label="Close sidebar"
           >
             ‹
           </button>
         </div>
 
         <button className="new-chat-btn" onClick={createConversation}>
-          <span className="plus-icon">+</span>
+          <span>+</span>
           <span>New Chat</span>
         </button>
 
-        {/* Search Bar */}
-        <div className="search-box">
-          <span className="search-icon">🔍</span>
-          <input
-            type="text"
-            className="search-input"
-            placeholder="Search questions..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-          />
-          {searchQuery && (
-            <button
-              className="clear-search-btn"
-              onClick={() => setSearchQuery("")}
-            >
-              ✕
-            </button>
-          )}
-        </div>
-
         <div className="conversations-section">
-          <div className="section-label-row">
-            <span className="section-label">Recent Questions</span>
-            <span className="conv-count">{filteredConversations.length}</span>
-          </div>
-
+          <p className="section-label">Recent Chats</p>
           <div className="conversation-list">
-            {filteredConversations.length === 0 ? (
-              <p className="empty-hint">
-                {searchQuery ? "No matching chats found" : "No chats yet. Start one!"}
-              </p>
-            ) : (
-              filteredConversations.map((conversation) => (
-                <div
-                  key={conversation._id}
-                  className={`conversation-item ${
-                    conversation._id === conversationId ? "active" : ""
-                  }`}
-                  onClick={() => openConversation(conversation._id)}
-                >
-                  <div className="conv-icon">
-                    💬
-                  </div>
-                  <div className="conv-body">
-                    <span className="conv-title" title={getConversationPreview(conversation)}>
-                      {getConversationPreview(conversation)}
-                    </span>
-                    <span className="conv-time">
-                      {formatTime(conversation.updatedAt || conversation.createdAt)}
-                    </span>
-                  </div>
-                  <button
-                    className="delete-conv-btn"
-                    title="Delete chat"
-                    onClick={(e) => deleteConversation(conversation._id, e)}
-                    aria-label="Delete chat"
-                  >
-                    🗑
-                  </button>
-                </div>
-              ))
+            {conversations.length === 0 && (
+              <p className="empty-hint">No conversations yet.</p>
             )}
+            {conversations.map((conversation) => (
+              <button
+                key={conversation._id}
+                className={`conversation-item ${conversation._id === conversationId ? "active" : ""}`}
+                onClick={() => openConversation(conversation._id)}
+              >
+                <div className="conv-icon">
+                  {conversation.title && conversation.title !== "New conversation"
+                    ? conversation.title.charAt(0).toUpperCase()
+                    : "✦"}
+                </div>
+                <div className="conv-body">
+                  <span className="conv-title">{getConversationPreview(conversation)}</span>
+                  <span className="conv-time">{formatTime(conversation.updatedAt)}</span>
+                </div>
+              </button>
+            ))}
           </div>
         </div>
       </aside>
@@ -306,20 +352,14 @@ function App() {
               ›
             </button>
           )}
-          <div className="header-title-box">
-            <h2 className="header-title">
-              {activeConversation
-                ? getConversationPreview(activeConversation)
-                : "New Discussion"}
-            </h2>
-            <span className="header-subtitle">
-              {activeConversation ? "Active session" : "Ask any question to begin"}
-            </span>
+          <div className="header-title">
+            {activeConversation
+              ? getConversationPreview(activeConversation)
+              : "NexusAI Chat"}
           </div>
-
           <div className="header-status">
             <div className={`status-dot ${loading ? "thinking" : "ready"}`}></div>
-            <span className="status-label">{loading ? "Generating…" : "Online"}</span>
+            <span className="status-label">{loading ? "Streaming…" : "Ready"}</span>
           </div>
         </header>
 
@@ -327,9 +367,9 @@ function App() {
           {messages.length === 0 && !loading && (
             <div className="welcome-screen">
               <div className="welcome-icon">✦</div>
-              <h1 className="welcome-title">What's on your mind?</h1>
+              <h1 className="welcome-title">How can I help you?</h1>
               <p className="welcome-sub">
-                Ask questions, explore topics, or pick an idea below to begin.
+                Ask me anything — I remember our conversation context.
               </p>
               <div className="suggestion-grid">
                 {suggestions.map((s) => (
@@ -341,8 +381,7 @@ function App() {
                       inputRef.current?.focus();
                     }}
                   >
-                    <span className="chip-arrow">↳</span>
-                    <span>{s}</span>
+                    {s}
                   </button>
                 ))}
               </div>
@@ -355,7 +394,7 @@ function App() {
               key={message._id || index}
             >
               <div className="message-avatar">
-                {message.role === "user" ? "You" : "✦"}
+                {message.role === "user" ? "U" : "✦"}
               </div>
               <div className="message-body">
                 <div className="message-meta">
@@ -367,37 +406,31 @@ function App() {
                       {formatMessageTime(message.createdAt)}
                     </span>
                   )}
-                  {message.role === "assistant" && (
-                    <button
-                      className="copy-btn"
-                      onClick={() =>
-                        copyToClipboard(message.content, message._id || index)
-                      }
-                      title="Copy response"
-                    >
-                      {copiedId === (message._id || index) ? "✓ Copied" : "📋 Copy"}
-                    </button>
-                  )}
                 </div>
                 <div className="message-content">
-                  <p>{message.content}</p>
+                  {message.isStreaming && !message.content ? (
+                    <div className="typing-indicator">
+                      <span></span><span></span><span></span>
+                    </div>
+                  ) : (
+                    <p>
+                      {message.content}
+                      {message.isStreaming && (
+                        <span className="streaming-cursor" aria-hidden="true">▍</span>
+                      )}
+                    </p>
+                  )}
                 </div>
                 {message.metadata && (
                   <div className="metadata-pills">
                     {message.metadata.topic && (
-                      <span className="meta-tag topic">
-                        Topic: {message.metadata.topic}
-                      </span>
+                      <span className="meta-tag topic">{message.metadata.topic}</span>
                     )}
                     {message.metadata.intent && (
-                      <span className="meta-tag intent">
-                        Intent: {message.metadata.intent}
-                      </span>
+                      <span className="meta-tag intent">{message.metadata.intent}</span>
                     )}
                     {message.metadata.sentiment && (
-                      <span className="meta-tag sentiment">
-                        Tone: {message.metadata.sentiment}
-                      </span>
+                      <span className="meta-tag sentiment">{message.metadata.sentiment}</span>
                     )}
                   </div>
                 )}
@@ -405,36 +438,10 @@ function App() {
             </article>
           ))}
 
-          {loading && (
-            <article className="message assistant">
-              <div className="message-avatar pulse-avatar">✦</div>
-              <div className="message-body">
-                <div className="message-meta">
-                  <span className="message-author">NexusAI</span>
-                  <span className="message-time">Thinking...</span>
-                </div>
-                <div className="message-content">
-                  <div className="typing-indicator">
-                    <span></span>
-                    <span></span>
-                    <span></span>
-                  </div>
-                </div>
-              </div>
-            </article>
-          )}
-
           {error && (
             <div className="error-banner" role="alert">
-              <span className="error-icon">⚠</span>
-              <span className="error-text">{error}</span>
-              <button
-                className="error-dismiss"
-                onClick={() => setError("")}
-                title="Dismiss"
-              >
-                ✕
-              </button>
+              <span>⚠ {error}</span>
+              <button className="error-dismiss" onClick={() => setError("")}>✕</button>
             </div>
           )}
 
@@ -447,43 +454,40 @@ function App() {
               <textarea
                 ref={inputRef}
                 value={input}
-                onChange={(e) => {
-                  setInput(e.target.value);
-                  autoResize(e);
-                }}
+                onChange={(e) => { setInput(e.target.value); autoResize(e); }}
                 onKeyDown={handleKeyDown}
-                placeholder="Ask your question… (Press Enter to send, Shift+Enter for new line)"
-                disabled={loading}
+                placeholder="Message NexusAI… (Shift+Enter for new line)"
                 rows={1}
                 className="chat-input"
                 aria-label="Message input"
               />
-              <button
-                type="submit"
-                className={`send-btn ${input.trim() && !loading ? "active" : ""}`}
-                disabled={loading || !input.trim()}
-                aria-label="Send message"
-                title="Send message"
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2.2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
+              {loading ? (
+                <button
+                  type="button"
+                  className="send-btn stop-btn active"
+                  onClick={stopGeneration}
+                  aria-label="Stop generating"
+                  title="Stop generating"
                 >
-                  <line x1="22" y1="2" x2="11" y2="13"></line>
-                  <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-                </svg>
-              </button>
-            </div>
-            <div className="input-footer">
-              <span className="input-hint">Enter to send · Shift+Enter for new line</span>
-              {input.length > 0 && (
-                <span className="char-count">{input.length} characters</span>
+                  <svg viewBox="0 0 24 24" fill="currentColor">
+                    <rect x="6" y="6" width="12" height="12" rx="2" />
+                  </svg>
+                </button>
+              ) : (
+                <button
+                  type="submit"
+                  className={`send-btn ${input.trim() ? "active" : ""}`}
+                  disabled={!input.trim()}
+                  aria-label="Send message"
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                    <line x1="22" y1="2" x2="11" y2="13"></line>
+                    <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                  </svg>
+                </button>
               )}
             </div>
+            <p className="input-hint">Enter to send · Shift+Enter for new line</p>
           </form>
         </div>
       </main>
@@ -492,4 +496,3 @@ function App() {
 }
 
 export default App;
-
